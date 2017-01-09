@@ -5,7 +5,7 @@ module ScopedSearch
   # to shape the query.
   class QueryBuilder
 
-    attr_reader :ast, :definition
+    attr_reader :ast, :definition, :scoped_klass
 
     # Creates a find parameter hash that can be passed to ActiveRecord::Base#find,
     # given a search definition and query string. This method is called from the
@@ -14,15 +14,18 @@ module ScopedSearch
     # This method will parse the query string and build an SQL query using the search
     # query. It will return an empty hash if the search query is empty, in which case
     # the scope call will simply return all records.
-    def self.build_query(definition, query, options = {})
+    def self.build_query(definition, klass, query, options = {})
       query_builder_class = self.class_for(definition)
-      if query.kind_of?(ScopedSearch::QueryLanguage::AST::Node)
-        return query_builder_class.new(definition, query, options[:profile]).build_find_params(options)
-      elsif query.kind_of?(String)
-        return query_builder_class.new(definition, ScopedSearch::QueryLanguage::Compiler.parse(query), options[:profile]).build_find_params(options)
-      else
-        raise ArgumentError, "Unsupported query object: #{query.inspect}!"
-      end
+
+      raise ScopedSearch::QueryNotSupported, "Class #{klass.name} cannot be queried as it is abstract" if klass.abstract_class?
+
+      query = ScopedSearch::QueryLanguage::Compiler.parse(query) if query.kind_of?(String)
+      raise ArgumentError, "Unsupported query object: #{query.inspect}!" unless query.kind_of?(ScopedSearch::QueryLanguage::AST::Node)
+
+      return query_builder_class.new(definition: definition,
+                                     ast: query,
+                                     profile: options[:profile],
+                                     scoped_klass: klass).build_find_params(options)
     end
 
     # Loads the QueryBuilder class for the connection of the given definition.
@@ -37,8 +40,11 @@ module ScopedSearch
     end
 
     # Initializes the instance by setting the relevant parameters
-    def initialize(definition, ast, profile)
-      @definition, @ast, @definition.profile = definition, ast, profile
+    def initialize(definition:, ast:, profile:, scoped_klass:)
+      @definition = definition
+      @ast = ast
+      @definition.profile = profile
+      @scoped_klass = scoped_klass
     end
 
     # Actually builds the find parameters hash that should be used in the search_for
@@ -86,19 +92,19 @@ module ScopedSearch
       return find_attributes
     end
 
-    def find_field_for_order_by(order, &block)
+    def find_field_def_for_order_by(order, &block)
       order ||= definition.default_order
       return [nil, nil] if order.blank?
       field_name, direction_name = order.to_s.split(/\s+/, 2)
-      field = definition.field_by_name(field_name)
-      raise ScopedSearch::QueryNotSupported, "the field '#{field_name}' in the order statement is not valid field for search" unless field
-      return field, direction_name
+      field_def = definition.field_by_name(field_name)
+      raise ScopedSearch::QueryNotSupported, "the field '#{field_name}' in the order statement is not valid field for search" unless field_def
+      return field_def, direction_name
     end
 
     def order_by(order, &block)
-      field, direction_name = find_field_for_order_by(order, &block)
-      return nil if field.nil?
-      sql = field.to_sql(&block)
+      field_def, direction_name = find_field_def_for_order_by(order, &block)
+      return nil if field_def.nil?
+      sql = field_def.to_field(scoped_klass).to_sql(&block)
       direction = (!direction_name.nil? && direction_name.downcase.eql?('desc')) ? " DESC" : " ASC"
       return sql + direction
     end
@@ -130,10 +136,11 @@ module ScopedSearch
     # This function needs a block that can be used to pass other information about the query
     # (parameters that should be escaped, includes) to the query builder.
     #
-    # <tt>field</tt>:: The field to test.
+    # <tt>field_def</tt>:: The field definition to test.
     # <tt>operator</tt>:: The operator used for comparison.
     # <tt>value</tt>:: The value to compare the field with.
-    def datetime_test(field, operator, value, &block) # :yields: finder_option_type, value
+    def datetime_test(field_def, operator, value, &block) # :yields: finder_option_type, value
+      field = field_def.to_field(scoped_klass)
 
       # Parse the value as a date/time and ignore invalid timestamps
       timestamp = definition.parse_temporal(value)
@@ -175,21 +182,21 @@ module ScopedSearch
     end
 
     # Validate the key name is in the set and translate the value to the set value.
-    def translate_value(field, value)
-      translated_value = field.complete_value[value.to_sym]
-      raise ScopedSearch::QueryNotSupported, "'#{field.field}' should be one of '#{field.complete_value.keys.join(', ')}', but the query was '#{value}'" if translated_value.nil?
+    def translate_value(field_def, value)
+      translated_value = field_def.complete_value[value.to_sym]
+      raise ScopedSearch::QueryNotSupported, "'#{field_def.field}' should be one of '#{field_def.complete_value.keys.join(', ')}', but the query was '#{value}'" if translated_value.nil?
       translated_value
     end
 
     # A 'set' is group of possible values, for example a status might be "on", "off" or "unknown" and the database representation
     # could be for example a numeric value. This method will validate the input and translate it into the database representation.
-    def set_test(field, operator,value, &block)
-      set_value = translate_value(field, value)
-      raise ScopedSearch::QueryNotSupported, "Operator '#{operator}' not supported for '#{field.field}'" unless [:eq,:ne].include?(operator)
+    def set_test(field_def, operator,value, &block)
+      set_value = translate_value(field_def, value)
+      raise ScopedSearch::QueryNotSupported, "Operator '#{operator}' not supported for '#{field_def.field}'" unless [:eq,:ne].include?(operator)
       negate = ''
       if [true,false].include?(set_value)
         negate = 'NOT ' if operator == :ne
-        if field.numerical?
+        if field_def.to_field(scoped_klass).numerical?
           operator =  (set_value == true) ?  :gt : :eq
           set_value = 0
         else
@@ -198,7 +205,7 @@ module ScopedSearch
         end
       end
       yield(:parameter, set_value)
-      return "#{negate}(#{field.to_sql(operator, &block)} #{self.sql_operator(operator, field)} ?)"
+      return "#{negate}(#{field_def.to_field(scoped_klass).to_sql(operator, &block)} #{self.sql_operator(operator, field_def.to_field(scoped_klass))} ?)"
     end
 
     # Generates a simple SQL test expression, for a field and value using an operator.
@@ -206,44 +213,45 @@ module ScopedSearch
     # This function needs a block that can be used to pass other information about the query
     # (parameters that should be escaped, includes) to the query builder.
     #
-    # <tt>field</tt>:: The field to test.
+    # <tt>field_def</tt>:: The field definition to test.
     # <tt>operator</tt>:: The operator used for comparison.
     # <tt>value</tt>:: The value to compare the field with.
-    def sql_test(field, operator, value, lhs, &block) # :yields: finder_option_type, value
-      return field.to_ext_method_sql(lhs, sql_operator(operator, field), value, &block) if field.ext_method
+    def sql_test(field_def, operator, value, lhs, &block) # :yields: finder_option_type, value
+      field = field_def.to_field(scoped_klass)
+      return field.to_ext_method_sql(lhs, sql_operator(operator, field), value, &block) if field_def.ext_method
 
-      yield(:keyparameter, lhs.sub(/^.*\./,'')) if field.key_field
+      yield(:keyparameter, lhs.sub(/^.*\./,'')) if field_def.key_field
 
       if [:like, :unlike].include?(operator)
         yield(:parameter, (value !~ /^\%|\*/ && value !~ /\%|\*$/) ? "%#{value}%" : value.tr_s('%*', '%'))
         return "#{field.to_sql(operator, &block)} #{self.sql_operator(operator, field)} ?"
 
       elsif [:in, :notin].include?(operator)
-        value.split(',').collect { |v| yield(:parameter, field.set? ? translate_value(field, v) : v.strip) }
+        value.split(',').collect { |v| yield(:parameter, field_def.set? ? translate_value(field_def, v) : v.strip) }
         value = value.split(',').collect { "?" }.join(",")
         return "#{field.to_sql(operator, &block)} #{self.sql_operator(operator, field)} (#{value})"
 
       elsif field.temporal?
-        return datetime_test(field, operator, value, &block)
+        return datetime_test(field_def, operator, value, &block)
 
-      elsif field.set?
-        return set_test(field, operator, value, &block)
+      elsif field_def.set?
+        return set_test(field_def, operator, value, &block)
 
-      elsif field.relation && definition.reflection_by_name(field.definition.klass, field.relation).macro == :has_many
-        value = value.to_i if field.offset
+      elsif field_def.relation && definition.reflection_by_name(scoped_klass, field_def.relation).macro == :has_many
+        value = value.to_i if field_def.offset
         yield(:parameter, value)
-        connection = field.definition.klass.connection
-        primary_key = "#{connection.quote_table_name(field.definition.klass.table_name)}.#{connection.quote_column_name(field.definition.klass.primary_key)}"
-        if definition.reflection_by_name(field.definition.klass, field.relation).options.has_key?(:through)
-          join = has_many_through_join(field)
+        connection = scoped_klass.connection
+        primary_key = "#{connection.quote_table_name(scoped_klass.table_name)}.#{connection.quote_column_name(scoped_klass.primary_key)}"
+        if definition.reflection_by_name(scoped_klass, field_def.relation).options.has_key?(:through)
+          join = has_many_through_join(field_def)
           return "#{primary_key} IN (SELECT #{primary_key} FROM #{join} WHERE #{field.to_sql(operator, &block)} #{self.sql_operator(operator, field)} ? )"
         else
-          foreign_key = connection.quote_column_name(field.reflection_keys(definition.reflection_by_name(field.definition.klass, field.relation))[1])
+          foreign_key = connection.quote_column_name(field.reflection_keys(definition.reflection_by_name(scoped_klass, field_def.relation))[1])
           return "#{primary_key} IN (SELECT #{foreign_key} FROM #{connection.quote_table_name(field.klass.table_name)} WHERE #{field.to_sql(operator, &block)} #{self.sql_operator(operator, field)} ? )"
         end
 
       else
-        value = value.to_i if field.offset
+        value = value.to_i if field_def.offset
         yield(:parameter, value)
         return "#{field.to_sql(operator, &block)} #{self.sql_operator(operator, field)} ?"
       end
@@ -259,9 +267,10 @@ module ScopedSearch
       middle_table_association
     end
 
-    def has_many_through_join(field)
-      many_class = field.definition.klass
-      through = definition.reflection_by_name(many_class, field.relation).options[:through]
+    def has_many_through_join(field_def)
+      field = field_def.to_field(scoped_klass)
+      many_class = scoped_klass
+      through = definition.reflection_by_name(many_class, field_def.relation).options[:through]
       connection = many_class.connection
 
       # table names
@@ -276,7 +285,7 @@ module ScopedSearch
       # primary and foreign keys + optional condition for the endpoint to middle join
       middle_table_association = find_has_many_through_association(field, through) || middle_table_name
       pk2, fk2   = field.reflection_keys(definition.reflection_by_name(field.klass, middle_table_association))
-      condition2 = field.reflection_conditions(definition.reflection_by_name(many_class, field.relation))
+      condition2 = field.reflection_conditions(definition.reflection_by_name(many_class, field_def.relation))
 
       <<-SQL
         #{connection.quote_table_name(many_table_name)}
@@ -300,21 +309,21 @@ module ScopedSearch
       def to_sql(operator = nil, &block) # :yields: finder_option_type, value
         num = rand(1000000)
         connection = klass.connection
-        if key_relation
-          yield(:joins, construct_join_sql(key_relation, num) )
-          yield(:keycondition, "#{key_klass.table_name}_#{num}.#{connection.quote_column_name(key_field.to_s)} = ?")
-          klass_table_name = relation ? "#{klass.table_name}_#{num}" : klass.table_name
-          return "#{connection.quote_table_name(klass_table_name)}.#{connection.quote_column_name(field.to_s)}"
-        elsif key_field
+        if field_definition.key_relation
+          yield(:joins, construct_join_sql(field_definition.key_relation, num) )
+          yield(:keycondition, "#{key_klass.table_name}_#{num}.#{connection.quote_column_name(field_definition.key_field.to_s)} = ?")
+          klass_table_name = field_definition.relation ? "#{klass.table_name}_#{num}" : klass.table_name
+          return "#{connection.quote_table_name(klass_table_name)}.#{connection.quote_column_name(field_definition.field.to_s)}"
+        elsif field_definition.key_field
           yield(:joins, construct_simple_join_sql(num))
-          yield(:keycondition, "#{key_klass.table_name}_#{num}.#{connection.quote_column_name(key_field.to_s)} = ?")
-          klass_table_name = relation ? "#{klass.table_name}_#{num}" : klass.table_name
-          return "#{connection.quote_table_name(klass_table_name)}.#{connection.quote_column_name(field.to_s)}"
-        elsif relation
-          yield(:include, relation)
+          yield(:keycondition, "#{key_klass.table_name}_#{num}.#{connection.quote_column_name(field_definition.key_field.to_s)} = ?")
+          klass_table_name = field_definition.relation ? "#{klass.table_name}_#{num}" : klass.table_name
+          return "#{connection.quote_table_name(klass_table_name)}.#{connection.quote_column_name(field_definition.field.to_s)}"
+        elsif field_definition.relation
+          yield(:include, field_definition.relation)
         end
-        column_name = connection.quote_table_name(klass.table_name.to_s) + "." + connection.quote_column_name(field.to_s)
-        column_name = "(#{column_name} >> #{offset*word_size} & #{2**word_size - 1})" if offset
+        column_name = connection.quote_table_name(klass.table_name.to_s) + "." + connection.quote_column_name(field_definition.field.to_s)
+        column_name = "(#{column_name} >> #{field_definition.offset*field_definition.word_size} & #{2**field_definition.word_size - 1})" if field_definition.offset
         column_name
       end
 
@@ -337,10 +346,10 @@ module ScopedSearch
 
         value_table_fk_key, key_table_pk = reflection_keys(definition.reflection_by_name(klass, key))
 
-        main_reflection = definition.reflection_by_name(definition.klass, relation)
+        main_reflection = definition.reflection_by_name(definition.klass, field_definition.relation)
         if main_reflection
           main_table = definition.klass.table_name
-          main_table_pk, value_table_fk_main = reflection_keys(definition.reflection_by_name(definition.klass, relation))
+          main_table_pk, value_table_fk_main = reflection_keys(definition.reflection_by_name(definition.klass, field_definition.relation))
 
           join_sql = "\n  INNER JOIN #{connection.quote_table_name(value_table)} #{value_table}_#{num} ON (#{main_table}.#{main_table_pk} = #{value_table}_#{num}.#{value_table_fk_main})"
           value_table = " #{value_table}_#{num}"
@@ -364,7 +373,7 @@ module ScopedSearch
         key_value_table = klass.table_name
 
         main_table = definition.klass.table_name
-        main_table_pk, value_table_fk_main = reflection_keys(definition.reflection_by_name(definition.klass, relation))
+        main_table_pk, value_table_fk_main = reflection_keys(definition.reflection_by_name(definition.klass, field_definition.relation))
 
         join_sql = "\n  INNER JOIN #{connection.quote_table_name(key_value_table)} #{key_value_table}_#{num} ON (#{connection.quote_table_name(main_table)}.#{connection.quote_column_name(main_table_pk)} = #{key_value_table}_#{num}.#{connection.quote_column_name(value_table_fk_main)})"
         return join_sql
@@ -410,14 +419,14 @@ module ScopedSearch
       module LeafNode
         def to_sql(builder, definition, &block)
           # for boolean fields allow a short format (example: for 'enabled = true' also allow 'enabled')
-          field = definition.field_by_name(value)
-          if field && field.set? && field.complete_value.values.include?(true)
-            key = field.complete_value.map{|k,v| k if v == true}.compact.first
-            return builder.set_test(field, :eq, key, &block)
+          field_def = definition.field_by_name(value)
+          if field_def && field_def.set? && field_def.complete_value.values.include?(true)
+            key = field_def.complete_value.map{|k,v| k if v == true}.compact.first
+            return builder.set_test(field_def, :eq, key, &block)
           end
           # Search keywords found without context, just search on all the default fields
-          fragments = definition.default_fields_for(value).map do |field|
-            builder.sql_test(field, field.default_operator, value,'', &block)
+          fragments = definition.default_fields_for(builder.scoped_klass, value).map do |field_def|
+            builder.sql_test(field_def, field_def.to_field(builder.scoped_klass).default_operator, value,'', &block)
           end
 
           case fragments.length
@@ -433,15 +442,15 @@ module ScopedSearch
 
         # Returns an IS (NOT) NULL SQL fragment
         def to_null_sql(builder, definition, &block)
-          field = definition.field_by_name(rhs.value)
-          raise ScopedSearch::QueryNotSupported, "Field '#{rhs.value}' not recognized for searching!" unless field
+          field_def = definition.field_by_name(rhs.value)
+          raise ScopedSearch::QueryNotSupported, "Field '#{rhs.value}' not recognized for searching!" unless field_def
 
-          if field.key_field
+          if field_def.key_field
             yield(:parameter, rhs.value.to_s.sub(/^.*\./,''))
           end
           case operator
-            when :null    then "#{field.to_sql(builder, &block)} IS NULL"
-            when :notnull then "#{field.to_sql(builder, &block)} IS NOT NULL"
+            when :null    then "#{field_def.to_field(builder.scoped_klass).to_sql(builder, &block)} IS NULL"
+            when :notnull then "#{field_def.to_field(builder.scoped_klass).to_sql(builder, &block)} IS NOT NULL"
           end
         end
 
@@ -450,8 +459,8 @@ module ScopedSearch
           raise ScopedSearch::QueryNotSupported, "Value not a leaf node" unless rhs.kind_of?(ScopedSearch::QueryLanguage::AST::LeafNode)
 
           # Search keywords found without context, just search on all the default fields
-          fragments = definition.default_fields_for(rhs.value, operator).map { |field|
-                          builder.sql_test(field, operator, rhs.value,'', &block) }.compact
+          fragments = definition.default_fields_for(builder.scoped_klass, rhs.value, operator).map { |field_def|
+                          builder.sql_test(field_def, operator, rhs.value,'', &block) }.compact
 
           case fragments.length
             when 0 then nil
@@ -466,13 +475,13 @@ module ScopedSearch
           raise ScopedSearch::QueryNotSupported, "Value not a leaf node"      unless rhs.kind_of?(ScopedSearch::QueryLanguage::AST::LeafNode)
 
           # Search only on the given field.
-          field = definition.field_by_name(lhs.value)
-          raise ScopedSearch::QueryNotSupported, "Field '#{lhs.value}' not recognized for searching!" unless field
+          field_def = definition.field_by_name(lhs.value)
+          raise ScopedSearch::QueryNotSupported, "Field '#{lhs.value}' not recognized for searching!" unless field_def
 
           # see if the value passes user defined validation
-          validate_value(field, rhs.value)
+          validate_value(field_def, rhs.value)
 
-          builder.sql_test(field, operator, rhs.value,lhs.value, &block)
+          builder.sql_test(field_def, operator, rhs.value,lhs.value, &block)
         end
 
         # Convert this AST node to an SQL fragment.
@@ -492,11 +501,11 @@ module ScopedSearch
 
         private
 
-        def validate_value(field, value)
-          validator = field.validator
+        def validate_value(field_def, value)
+          validator = field_def.validator
           if validator
             valid = validator.call(value)
-            raise ScopedSearch::QueryNotSupported, "Value '#{value}' is not valid for field '#{field.field}'" unless valid
+            raise ScopedSearch::QueryNotSupported, "Value '#{value}' is not valid for field '#{field_def.field}'" unless valid
           end
         end
       end
@@ -518,12 +527,12 @@ module ScopedSearch
       # Switches out the default query generation of the <tt>sql_test</tt>
       # method if full text searching is enabled and a text search is being
       # performed.
-      def sql_test(field, operator, value, lhs, &block)
-        if [:like, :unlike].include?(operator) && field.full_text_search
+      def sql_test(field_def, operator, value, lhs, &block)
+        if [:like, :unlike].include?(operator) && field_def.full_text_search
           yield(:parameter, value)
           negation = (operator == :unlike) ? "NOT " : ""
-          locale = (field.full_text_search == true) ? 'english' : field.full_text_search
-          return "#{negation}to_tsvector('#{locale}', #{field.to_sql(operator, &block)}) #{self.sql_operator(operator, field)} to_tsquery('#{locale}', ?)"
+          locale = (field_def.full_text_search == true) ? 'english' : field_def.full_text_search
+          return "#{negation}to_tsvector('#{locale}', #{field_def.to_field(scoped_klass).to_sql(operator, &block)}) #{self.sql_operator(operator, field_def.to_field(scoped_klass))} to_tsquery('#{locale}', ?)"
         else
           super
         end
@@ -533,7 +542,7 @@ module ScopedSearch
       # method for ILIKE or @@ if full text searching is enabled.
       def sql_operator(operator, field)
         raise ScopedSearch::QueryNotSupported, "the operator '#{operator}' is not supported for field type '#{field.type}'" if [:like, :unlike].include?(operator) and !field.textual?
-        return '@@' if [:like, :unlike].include?(operator) && field.full_text_search
+        return '@@' if [:like, :unlike].include?(operator) && field.field_definition.full_text_search
         case operator
           when :like   then 'ILIKE'
           when :unlike then 'NOT ILIKE'
@@ -549,8 +558,8 @@ module ScopedSearch
       def order_by(order, &block)
         sql = super(order, &block)
         if sql
-          field, _ = find_field_for_order_by(order, &block)
-          sql += sql.include?('DESC') ? ' NULLS LAST ' : ' NULLS FIRST ' if !field.nil? && field.column.null
+          field_def, _ = find_field_def_for_order_by(order, &block)
+          sql += sql.include?('DESC') ? ' NULLS LAST ' : ' NULLS FIRST ' if !field_def.nil? && field_def.to_field(scoped_klass).column.null
         end
         sql
       end

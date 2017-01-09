@@ -13,14 +13,14 @@ module ScopedSearch
     #
     # Instances of this class are created when calling scoped_search in your model
     # class, so you should not create instances of this class yourself.
-    class Field
+    class FieldDefinition
 
       attr_reader :definition, :field, :only_explicit, :relation, :key_relation, :full_text_search,
                   :key_field, :complete_value, :complete_enabled, :offset, :word_size, :ext_method, :operators,
-                  :validator
+                  :validator, :default_operator
 
-      # Initializes a Field instance given the definition passed to the
-      # scoped_search call on the ActiveRecord-based model class.
+      # Initializes a FieldDefinition instance given the definition passed to
+      # the scoped_search call on the ActiveRecord-based model class.
       #
       # Field name may be given in positional 'field' argument or 'on' named
       # argument.
@@ -87,21 +87,54 @@ module ScopedSearch
         aliases.each { |al| definition.define_field(al, self) }
       end
 
+      # Initializes a new instance of Field for this field definition on a particular
+      # class being searched
+      def to_field(scoped_klass)
+        Field.new(self, scoped_klass)
+      end
+
+      # Returns true if this is a set.
+      def set?
+        complete_value.is_a?(Hash)
+      end
+
+      def generate_default_order(default_order, field)
+        order = (default_order.to_s.downcase.include?('desc')) ? "DESC" : "ASC"
+        return "#{field} #{order}"
+      end
+    end
+
+    # An instance of a FieldDefinition when searching on a class.
+    #
+    # A field definition may be defined in a base class, but the search scope may be called on
+    # a subclass. The Field is instantiated with the definition plus the class in use.
+    class Field
+      attr_reader :field_definition, :scoped_klass
+
+      def initialize(field_definition, scoped_klass)
+        @field_definition = field_definition
+        @scoped_klass = scoped_klass
+      end
+
+      def definition
+        field_definition.definition
+      end
+
       # The ActiveRecord-based class that belongs to this field.
       def klass
-        @klass ||= if relation
-          definition.reflection_by_name(definition.klass, relation).klass
+        @klass ||= if field_definition.relation
+          definition.reflection_by_name(scoped_klass, field_definition.relation).klass
         else
-          definition.klass
+          scoped_klass
         end
       end
 
       # The ActiveRecord-based class that belongs the key field in a key-value pair.
       def key_klass
-        @key_klass ||= if key_relation
-          definition.reflection_by_name(definition.klass, key_relation).klass
-        elsif relation
-          definition.reflection_by_name(definition.klass, relation).klass
+        @key_klass ||= if field_definition.key_relation
+          definition.reflection_by_name(definition.klass, field_definition.key_relation).klass
+        elsif field_definition.relation
+          definition.reflection_by_name(definition.klass, field_definition.relation).klass
         else
           definition.klass
         end
@@ -110,10 +143,10 @@ module ScopedSearch
       # Returns the ActiveRecord column definition that corresponds to this field.
       def column
         @column ||= begin
-          if klass.columns_hash.has_key?(field.to_s)
-            klass.columns_hash[field.to_s]
+          if klass.columns_hash.has_key?(field_definition.field.to_s)
+            klass.columns_hash[field_definition.field.to_s]
           else
-            raise ActiveRecord::UnknownAttributeError.new(klass, field)
+            raise ActiveRecord::UnknownAttributeError.new(klass, field_definition.field)
           end
         end
       end
@@ -149,28 +182,19 @@ module ScopedSearch
         [:string, :text].include?(type)
       end
 
-      # Returns true if this is a set.
-      def set?
-        complete_value.is_a?(Hash)
-      end
-
       # Returns the default search operator for this field.
       def default_operator
-        @default_operator ||= case type
-          when :string, :text then :like
-          else :eq
-        end
-      end
-
-      def generate_default_order(default_order, field)
-        order = (default_order.to_s.downcase.include?('desc')) ? "DESC" : "ASC"
-        return "#{field} #{order}"
+        @default_operator ||=
+          field_definition.default_operator || case type
+            when :string, :text then :like
+            else :eq
+          end
       end
 
       # Return 'table'.'column' with the correct database quotes
       def quoted_field
         c = klass.connection
-        "#{c.quote_table_name(klass.table_name)}.#{c.quote_column_name(field)}"
+        "#{c.quote_table_name(klass.table_name)}.#{c.quote_column_name(field_definition.field)}"
       end
     end
 
@@ -228,11 +252,13 @@ module ScopedSearch
     end
 
     # this method is used by the syntax auto completer to suggest operators.
-    def operator_by_field_name(name)
-      field = field_by_name(name)
-      return [] if field.nil?
-      return field.operators                                      if field.operators
-      return ['= ', '!= ']                                        if field.set?
+    def operator_by_field_name(scoped_klass, name)
+      field_def = field_by_name(name)
+      return [] if field_def.nil?
+      return field_def.operators                                  if field_def.operators
+      return ['= ', '!= ']                                        if field_def.set?
+
+      field = field_def.to_field(scoped_klass)
       return ['= ', '> ', '< ', '<= ', '>= ','!= ', '^ ', '!^ ']  if field.numerical?
       return ['= ', '!= ', '~ ', '!~ ', '^ ', '!^ ']              if field.textual?
       return ['= ', '> ', '< ']                                   if field.temporal?
@@ -243,7 +269,7 @@ module ScopedSearch
     INTEGER_REGXP = /^\-?\d+$/
 
     # Returns a list of appropriate fields to search in given a search keyword and operator.
-    def default_fields_for(value, operator = nil)
+    def default_fields_for(scoped_klass, value, operator = nil)
 
       column_types  = []
       column_types += [:string, :text]                if [nil, :like, :unlike, :ne, :eq].include?(operator)
@@ -251,7 +277,7 @@ module ScopedSearch
       column_types += [:integer]                      if value =~ INTEGER_REGXP
       column_types += [:datetime, :date, :timestamp]  if (parse_temporal(value))
 
-      default_fields.select { |field| column_types.include?(field.type) && !field.set? }
+      default_fields.select { |field_def| column_types.include?(field_def.to_field(scoped_klass).type) && !field_def.set? }
     end
 
     # Try to parse a string as a datetime.
@@ -275,7 +301,7 @@ module ScopedSearch
 
     # Defines a new search field for this search definition.
     def define(*args)
-      Field.new(self, *args)
+      FieldDefinition.new(self, *args)
     end
 
     # Returns a reflection for a given klass and name
@@ -294,7 +320,7 @@ module ScopedSearch
         definition = klass.scoped_search_definition
 
         search_scope = klass.all
-        find_options = ScopedSearch::QueryBuilder.build_query(definition, query || '', options)
+        find_options = ScopedSearch::QueryBuilder.build_query(definition, klass, query || '', options)
         search_scope = search_scope.where(find_options[:conditions])   if find_options[:conditions]
         search_scope = search_scope.includes(find_options[:include])   if find_options[:include]
         search_scope = search_scope.joins(find_options[:joins])        if find_options[:joins]
@@ -313,7 +339,7 @@ module ScopedSearch
 
   module AutoCompleteClassMethods
     def complete_for(query, options = {})
-      ScopedSearch::AutoCompleteBuilder.auto_complete(scoped_search_definition, query, options)
+      ScopedSearch::AutoCompleteBuilder.auto_complete(scoped_search_definition, self, query, options)
     end
   end
 end

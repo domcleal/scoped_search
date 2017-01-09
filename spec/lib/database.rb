@@ -43,7 +43,7 @@ module ScopedSearch::RSpec::Database
     ActiveRecord::Base.remove_connection
   end
 
-  def self.create_model(fields)
+  def self.create_model(fields, parent = ActiveRecord::Base)
     table_name = "model_#{rand}".gsub(/\W/, '')
     ActiveRecord::Migration.create_table(table_name) do |t|
       fields.each do |name, field_type|
@@ -52,8 +52,16 @@ module ScopedSearch::RSpec::Database
       end
     end
 
-    klass = ScopedSearch::RSpec::Database.const_set(table_name.classify, Class.new(ActiveRecord::Base))
+    klass = ScopedSearch::RSpec::Database.const_set(table_name.classify, Class.new(parent))
     klass.table_name = table_name
+    yield(klass) if block_given?
+    return klass
+  end
+
+  def self.create_abstract_model
+    klass_name = "abstract_#{rand}".gsub(/\W/, '')
+    klass = ScopedSearch::RSpec::Database.const_set(klass_name.classify, Class.new(ActiveRecord::Base))
+    klass.abstract_class = true
     yield(klass) if block_given?
     return klass
   end
@@ -70,6 +78,6 @@ module ScopedSearch::RSpec::Database
       ActiveRecord::Migration.drop_table(klass.const_get(habtm_class).table_name)
       klass.send(:remove_const, habtm_class)
     end
-    ActiveRecord::Migration.drop_table(klass.table_name)
+    ActiveRecord::Migration.drop_table(klass.table_name) unless klass.abstract_class?
   end
 end

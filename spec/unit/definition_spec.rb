@@ -9,7 +9,7 @@ describe ScopedSearch::Definition do
     @klass.stub(:scoped_search_definition).and_return(@definition)
   end
 
-  describe ScopedSearch::Definition::Field do
+  describe ScopedSearch::Definition::FieldDefinition do
     describe '#initialize' do
       it "should raise an exception with missing field or 'on' keyword" do
         lambda {
@@ -45,17 +45,19 @@ describe ScopedSearch::Definition do
         @definition.fields.keys.should eq([:field, :foo])
       end
     end
+  end
 
+  describe ScopedSearch::Definition::Field do
     describe '#column' do
       it "should raise an exception when using an unknown field" do
         lambda {
-          @definition.define(:on => 'nonexisting').column
+          @definition.define(:on => 'nonexisting').to_field(@klass).column
         }.should raise_error(ActiveRecord::UnknownAttributeError)
       end
 
       it "should not raise an exception when using an unknown field" do
         lambda {
-          @definition.define(:on => 'existing').column
+          @definition.define(:on => 'existing').to_field(@klass).column
         }.should_not raise_error
       end
     end

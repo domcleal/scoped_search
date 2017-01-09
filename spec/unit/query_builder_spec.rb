@@ -2,9 +2,11 @@ require "spec_helper"
 
 describe ScopedSearch::QueryBuilder do
 
+  let(:klass) { Class.new(ActiveRecord::Base) }
+
   before(:each) do
     @definition = double('ScopedSearch::Definition')
-    @definition.stub(:klass).and_return(Class.new(ActiveRecord::Base))
+    @definition.stub(:klass).and_return(klass)
     @definition.stub(:profile).and_return(:default)
     @definition.stub(:default_order).and_return(nil)
     @definition.stub(:profile=).and_return(true)
@@ -12,15 +14,15 @@ describe ScopedSearch::QueryBuilder do
   end
 
   it "should raise an ArgumentError if the query is not set" do
-    lambda { ScopedSearch::QueryBuilder.build_query(@definition, nil) }.should raise_error(ArgumentError)
+    lambda { ScopedSearch::QueryBuilder.build_query(@definition, klass, nil) }.should raise_error(ArgumentError)
   end
 
   it "should return empty conditions if the query is blank" do
-    ScopedSearch::QueryBuilder.build_query(@definition, "").should == { }
+    ScopedSearch::QueryBuilder.build_query(@definition, klass, "").should == { }
   end
 
   it "should return empty conditions if the query is whitespace only" do
-    ScopedSearch::QueryBuilder.build_query(@definition, "\t ").should == {  }
+    ScopedSearch::QueryBuilder.build_query(@definition, klass, "\t ").should == {  }
   end
 
   it "should use default adapter when connection type is unknown" do
@@ -42,7 +44,7 @@ describe ScopedSearch::QueryBuilder do
 
     @definition.stub(:field_by_name).and_return(field)
 
-    lambda { ScopedSearch::QueryBuilder.build_query(@definition, 'test_field = test_val') }.should raise_error(ScopedSearch::QueryNotSupported)
+    lambda { ScopedSearch::QueryBuilder.build_query(@definition, klass, 'test_field = test_val') }.should raise_error(ScopedSearch::QueryNotSupported)
   end
 
   it "should display custom error from validator" do
@@ -53,6 +55,6 @@ describe ScopedSearch::QueryBuilder do
 
     @definition.stub(:field_by_name).and_return(field)
 
-    lambda { ScopedSearch::QueryBuilder.build_query(@definition, 'test_field = test_val') }.should raise_error('my custom message')
+    lambda { ScopedSearch::QueryBuilder.build_query(@definition, klass, 'test_field = test_val') }.should raise_error('my custom message')
   end
 end

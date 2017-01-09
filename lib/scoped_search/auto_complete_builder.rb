@@ -11,23 +11,28 @@ module ScopedSearch
     COMPARISON_OPERATORS     = ScopedSearch::QueryLanguage::Parser::COMPARISON_OPERATORS
     PREFIX_OPERATORS         = LOGICAL_PREFIX_OPERATORS + NULL_PREFIX_OPERATORS
 
-    attr_reader :ast, :definition, :query, :tokens
+    attr_reader :ast, :definition, :query, :tokens, :scoped_klass
 
     # This method will parse the query string and build  suggestion list using the
     # search query.
-    def self.auto_complete(definition, query, options = {})
+    def self.auto_complete(definition, klass, query, options = {})
       return [] if (query.nil? or definition.nil? or !definition.respond_to?(:fields))
+      raise ScopedSearch::QueryNotSupported, "Class #{klass.name} cannot be queried as it is abstract" if klass.abstract_class?
 
-      new(definition, query, options).build_autocomplete_options
+      new(definition: definition,
+          options: options,
+          query: query,
+          scoped_klass: klass).build_autocomplete_options
     end
 
     # Initializes the instance by setting the relevant parameters
-    def initialize(definition, query, options)
-      @definition = definition
-      @ast        = ScopedSearch::QueryLanguage::Compiler.parse(query)
-      @query      = query
-      @tokens     = tokenize
-      @options    = options
+    def initialize(definition:, query:, options:, scoped_klass:)
+      @definition   = definition
+      @ast          = ScopedSearch::QueryLanguage::Compiler.parse(query)
+      @query        = query
+      @tokens       = tokenize
+      @options      = options
+      @scoped_klass = scoped_klass
     end
 
     # Test the validity of the current query and suggest possible completion
@@ -84,12 +89,12 @@ module ScopedSearch
     def is_query_valid
       # skip test for null prefix operators if in the process of completing the field name.
       return if(last_token_is(NULL_PREFIX_OPERATORS, 2) && !(query =~ /(\s|\)|,)$/))
-      QueryBuilder.build_query(definition, query)
+      QueryBuilder.build_query(definition, scoped_klass, query)
     end
 
     def is_left_hand(node)
-      field = definition.field_by_name(node.value) if node.respond_to?(:value)
-      lh = field.nil? || field.key_field && !(query.end_with?(' '))
+      field_def = definition.field_by_name(node.value) if node.respond_to?(:value)
+      lh = field_def.nil? || field_def.key_field && !(query.end_with?(' '))
       lh = lh || last_token_is(NULL_PREFIX_OPERATORS, 2)
       lh = lh && !is_right_hand
       lh
@@ -165,13 +170,14 @@ module ScopedSearch
     end
 
     #this method completes the keys list in a key-value schema in the format table.keyName
-    def complete_key(name, field, val)
+    def complete_key(name, field_def, val)
       return ["#{name}."] if !val || !val.is_a?(String) || !(val.include?('.'))
       val = val.sub(/.*\./,'')
+      field = field_def.to_field(scoped_klass)
 
       connection    = definition.klass.connection
       quoted_table  = field.key_klass.connection.quote_table_name(field.key_klass.table_name)
-      quoted_field  = field.key_klass.connection.quote_column_name(field.key_field)
+      quoted_field  = field.key_klass.connection.quote_column_name(field_def.key_field)
       field_name    = "#{quoted_table}.#{quoted_field}"
 
       field.key_klass
@@ -179,7 +185,7 @@ module ScopedSearch
         .select(field_name)
         .limit(20)
         .distinct
-        .map(&field.key_field)
+        .map(&field_def.key_field)
         .compact
         .map { |f| "#{name}.#{f} " }
     end
@@ -194,19 +200,20 @@ module ScopedSearch
         val = tokens[tokens.size - 1]
       end
 
-      field = definition.field_by_name(token)
-      return [] unless field && field.complete_value
+      field_def = definition.field_by_name(token)
+      return [] unless field_def && field_def.complete_value
 
-      return complete_set(field) if field.set?
+      field = field_def.to_field(scoped_klass)
+      return complete_set(field_def) if field_def.set?
       return complete_date_value if field.temporal?
-      return complete_key_value(field, token, val) if field.key_field
+      return complete_key_value(field_def, field, token, val) if field_def.key_field
 
       completer_scope(field)
         .where(value_conditions(field.quoted_field, val))
         .select(field.quoted_field)
         .limit(20)
         .distinct
-        .map(&field.field)
+        .map(&field_def.field)
         .compact
         .map { |v| v.to_s =~ /\s/ ? "\"#{v.gsub('"', '\"')}\"" : v }
     end
@@ -218,8 +225,8 @@ module ScopedSearch
     end
 
     # set value completer
-    def complete_set(field)
-      field.complete_value.keys
+    def complete_set(field_def)
+      field_def.complete_value.keys
     end
     # date value completer
     def complete_date_value
@@ -239,9 +246,9 @@ module ScopedSearch
     end
 
     # complete values in a key-value schema
-    def complete_key_value(field, token, val)
+    def complete_key_value(field_def, field, token, val)
       key_name = token.sub(/^.*\./,"")
-      key_klass = field.key_klass.where(field.key_field => key_name).first
+      key_klass = field.key_klass.where(field_def.key_field => key_name).first
       raise ScopedSearch::QueryNotSupported, "Field '#{key_name}' not recognized for searching!" if key_klass.nil?
 
       query = completer_scope(field)
@@ -256,7 +263,7 @@ module ScopedSearch
         .where(value_conditions(field.quoted_field, val))
         .select("DISTINCT #{field.quoted_field}")
         .limit(20)
-        .map(&field.field)
+        .map(&field_def.field)
         .compact
         .map { |v| v.to_s =~ /\s/ ? "\"#{v}\"" : v }
     end
@@ -268,7 +275,7 @@ module ScopedSearch
 
     # This method complete infix operators by field type
     def complete_operator(node)
-      definition.operator_by_field_name(node.value)
+      definition.operator_by_field_name(scoped_klass, node.value)
     end
   end
 end
